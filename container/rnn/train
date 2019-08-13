@@ -1,0 +1,232 @@
+#!/usr/bin/env python
+
+################################################
+#          Time series forecasts using         #
+#         a combo RNN architecture with        #
+#              GRU and covariates              #
+################################################
+
+
+# From ref byo code
+from __future__ import print_function
+import os, re, sys, json, pickle, h5py, traceback
+import numpy as np
+import pandas as pd
+import keras
+from sklearn import preprocessing
+from sklearn.metrics import mean_squared_error
+from keras.models import Sequential
+from keras.layers.core import Dense, Dropout, Activation
+from keras.layers.recurrent import LSTM
+from keras.models import load_model
+from keras.layers import Input, GRU, Dense, concatenate, Activation 
+from keras.models import Model  
+from textblob import TextBlob
+
+# Paths where to mount input/output/model in container
+prefix = '/opt/ml/'
+input_path = prefix + 'input/data'
+output_path = os.path.join(prefix, 'output')
+model_path = os.path.join(prefix, 'model')
+channel_name='training'
+training_path = os.path.join(input_path, channel_name)
+
+# Hard coded hyperparameters for RNN:
+target = 'STOCKA'       # Name of target stock
+covariates = ['STOCKB'] # List of covariate stocks
+nunits = 256          # Number of GRUs in recurrent layer
+lag = 22              # Time lags / memory span to regress from
+horiz = 10            # Steps in the future to forecast
+yweight = .8          # Weight of RNN based on y only (holonomic constraint for xyweight)
+nepochs = 100         # Number of epochs
+d = 0.2               # Percent of neurons to drop at each epoch
+optimizer = 'adam'    # Optimization algorithm (previously rmsprop)
+activ = 'elu'         # Activation function for neurons (elu faster than sigmoid)
+verbose = False       # Whether or not to list results of each epoch
+activd = 'linear'     # Dense layer's activation function
+lossmetric = 'mean_absolute_error'  # Loss function for gradient descent 
+
+def train():
+    try:
+
+        #####################################################
+        #                                                   #
+        #      Engineer new features and save to file       #
+        #                                                   #
+        #####################################################
+
+        # Read input data (time series of stock values and top news headlines)
+        filelist = os.listdir(training_path)
+        file_news = os.path.join(training_path, 'Combined_News_DJIA.csv')
+        file_stocks = os.path.join(training_path, 'stockprices.csv')
+        news = pd.read_csv(file_news, index_col = 0)
+        d = pd.read_csv(file_stocks, index_col = 0)
+
+        # Extract daily overall market sentiment from top news headlines 
+        # Use TextBlob to compute sentiment polarity (range = [-1,1])
+        def get_sentiment(x):
+            res = TextBlob(' '.join(re.sub("(@[A-Za-z0-9]+)|([^0-9A-Za-z \t])|(\w+:\/\/\S+)", " ", x).split()))
+            return round(res.sentiment.polarity,2)
+
+        # Loop over news headline every day, extract sentiment and sum it up for the day
+        news['s'] = 0
+        for i in range(2,22):  # Run over 20 top news articles
+            col = 'Top' + str(i+1)
+            news['s'] = news['s'] + np.array([ get_sentiment(x) for x in news[col] ])
+
+        # Sync dates with stock values dataset
+        alldata = d[d.symbol == target]
+        news = news[news.index >= alldata.index[0]]
+        alldata = alldata[alldata.index <= news.index[-1]] # Stop alldata when no news data in file
+        s = alldata.shape
+        df = pd.DataFrame([0] * s[0],columns=['s'],index=alldata.index)
+        j = 0
+        for i in range(s[0]):
+            if (news.index[j] == df.index[i]):   
+                df['s'].iloc[i] = news['s'].iloc[j]
+                j +=  1
+            elif (news.index[j] < df.index[i]):
+            i -= 1 # Wait 1 step if there is a day with news data but no stock data
+            j += 1
+            else:
+                df['s'].iloc[i] = news['s'].iloc[j-1]
+        news = df
+
+        # Save to file
+        sentiment = 'sentiment.csv'
+        news.to_csv(os.path.join(model_path, sentiment))
+
+        # Define covariates of interest
+        d = pd.read_csv(file_stocks, index_col = 0)
+
+        # Select training data (90% of dataset) and test data (remaining 10%) for covariates of interest
+        data = d[d.symbol == target]
+        row = round(0.9 * data.shape[0]) # 90% split, hardcoded for now
+        traindata = data[:int(row)]
+        testdata = data[int(row):]
+        for covariate in covariates:
+            d1 = d[d.symbol == covariate]
+            traindata = traindata.append(d1[:int(row)])
+            testdata = testdata.append(d1[int(row):])
+
+        # Save to file (training data needed during prediction when rescaling new observations)
+        trainfile = 'traindata.csv'
+        testfile = 'testdata.csv'
+        traindata.to_csv(os.path.join(model_path, trainfile))
+        testdata.to_csv(os.path.join(model_path, testfile))
+
+        #################################################
+        #                                               #
+        #         Select and scale time series          #
+        #                                               #
+        #################################################
+
+        # Function to normalize ML inputs
+        def normalize_data(df):
+            df = df.diff() # Differencing (order 1) applied because use case (stock) tends to increase linearly (non-stationary)
+            df = df.replace(np.nan, 0)
+            scaler = preprocessing.StandardScaler()  # or: MinMaxScaler(feature_range=(0,1))
+            for feat in df.columns: 
+                print('Rescaling ',feat)
+                df[feat] = scaler.fit_transform(df.eval(feat).values.reshape(-1,1))
+                return df
+
+        # Main time series
+        train_main = pd.read_csv(file_stocks, index_col = 0)
+        print('Rescaling ',target)
+        train_main = train_main[train_main.symbol == target]
+        train_main["adjclose"] = train_main.close # Moving close to the last column
+        train_main.drop(['close','symbol'], 1, inplace=True)
+        train_main = normalize_data(train_main)
+
+        # Exogenous time series
+        train_exo = pd.read_csv(file_stocks, index_col = 0)
+        i=0
+        for covariate in covariates:
+            print('Rescaling ',covariate)
+            train_exo1 = train_exo[train_exo.symbol == covariate]
+            # Plug in market sentiment here
+            news = news[news.index <= train_exo1.index[-1]] 
+            train_exo1["s"] = news.s
+            train_exo1["adjclose"] = train_exo1.close
+            train_exo1.drop(['close','symbol'], 1, inplace=True)
+            train_exo1 = normalize_data(train_exo1) 
+            if i == 0:
+                train_exo = train_exo1
+            else:
+                train_exo = train_exo.append(train_exo1)
+                i+=1
+
+        def load_data(stock, lag, horiz, nfeatures):  
+            data = stock.as_matrix() 
+            lags = []
+            horizons = []
+            
+            nsample = len(data) - lag - horiz  # Number of time series (Number of sample in 3D)
+            for i in range(nsample): 
+                lags.append(data[i: i + lag , -nfeatures:]) 
+                horizons.append(data[i + lag : i + lag + horiz, -1])
+            
+            lags = np.array(lags)
+            horizons = np.array(horizons)
+            print("Number of horizons (train + test): ", len(horizons))
+            row = round(0.9 * lags.shape[0]) # 90% split
+            x_train = lags[:int(row), :] # 90% date, all feature lags 
+            y_train = horizons[:int(row),:] # 90% date, y horizons CHECK there is only 1 column
+            x_train = np.reshape(x_train, (x_train.shape[0], x_train.shape[1], nfeatures))
+
+            return [x_train, y_train, nfeatures]
+
+        Xmain_train, ymain_train, nfeatmain = load_data(train_main, lag, horiz, 2)
+        Xexo_train, yexo_train, nfeatexo = load_data(train_exo, lag, horiz, 3) # 3rd feat is sentiment
+
+        #################################################
+        #                                               #
+        #      Define and train RNN deep learning       #
+        #                                               #
+        #################################################
+
+        # Create dynamic network based on Gated Recurrent Units (GRU) for target 
+        main_in = Input(shape=(lag, nfeatmain), dtype='float32', name='main_in')
+        main_gru = GRU(units=nunits,return_sequences=False,activation=activ,recurrent_activation='hard_sigmoid',dropout=d)(main_in)
+        main_out = Dense(horiz, activation=activd, name='main_out')(main_gru) 
+
+        # Create dynamic network based on Gated Recurrent Units (GRU) for covariates
+        exo_in = Input(shape=(lag, nfeatexo), dtype='float32', name='exo_in')
+        exo_gru = GRU(units=nunits,return_sequences=False,activation=activ,recurrent_activation='hard_sigmoid',dropout=d,name='grulayer')(exo_in)
+        exo_out = Dense(horiz, activation=activd, name='exo_out')(exo_gru) 
+
+        # Merge the two resulting layers
+        # z = concatenate([main_out, exo_out]) # Option 1
+        z = concatenate([main_gru, exo_gru])   # Option 2
+
+        # Create a dense layer for all merged data
+        combo_out = Dense(horiz, activation=activ, name='combo_out')(z)
+
+        # Define final model input / output flows, compile parameters
+        xyweight = 1 - yweight # hyperparameters
+        model = Model(inputs=[main_in, exo_in], outputs=[main_out, combo_out])
+        model.compile(optimizer=optimizer, loss=lossmetric, loss_weights=[yweight, xyweight])
+        #print("Compilation Time : ", time.time() - start)
+
+        # Train the model 
+        fcst = model.fit({'main_in': Xmain_train, 'exo_in': Xexo_train},{'main_out': ymain_train, 'combo_out': ymain_train}, epochs=nepochs,verbose=verbose)
+
+        # Save the model
+        model.save(os.path.join(model_path, 'rnn-combo-model.h5'))
+
+        print('Training complete')
+        
+    except Exception as e:
+        trc = traceback.format_exc()
+        with open(os.path.join(output_path, 'failure'), 'w') as s:
+            s.write('Exception during training: ' + str(e) + '\n' + trc)
+        print('Exception during training: ' + str(e) + '\n' + trc, file=sys.stderr)
+        sys.exit(255)
+
+if __name__ == '__main__':
+    train()
+
+    # Zero exit code => Success
+    sys.exit(0)
+

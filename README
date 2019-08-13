@@ -1,0 +1,1 @@
+This directory contains all files needed to run and benchmark time series analysis of financial stocks. Just upload the entire directory on SageMaker. The Jupyter notebook is what you need to get started, all other associated files are called from that notebook. Questions? > curukj@amazon.com

@@ -1,0 +1,13 @@
+To test locally, can use this set of docker commands:
+
+cd container
+./doclocal.sh rnn
+cd local_test/
+./serve_local.sh rnn
+./predict.sh testdata.csv text/csv
+
+docker ps
+docker stop <Id>
+docker rm <Id> 
+
+PS: Test and web versions notably differ in how predictor.py reads data: StringIO.StringIO(data) needs be used before opening the CSV file when running locally, while CSV needs be read directly when on Flask (this can be set with variable s_on in line 79)
